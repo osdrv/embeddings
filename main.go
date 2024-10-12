@@ -3,59 +3,53 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"math"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
+	"sandbox/embeddings/pkg/embeddings"
 
-	// "github.com/RediSearch/redisearch-go/redisearch"
-	ollama "github.com/ollama/ollama/api"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-	model := flag.String("model", "", "Ollama model to use")
+	modelName := flag.String("model", "", "Ollama model to use")
 	ollamaAddr := flag.String("ollama_addr", "http://127.0.0.1:11434", "Ollama address")
 	indexDim := flag.Int("index_dim", 1024, "Index dimension")
 	indexDist := flag.String("index_dist", "COSINE", "Index distance function")
+	readFrom := flag.String("read_from", "", "Read embeddings from file")
+	backend := flag.String("backend", "redis", "Backend to use")
 
 	flag.Parse()
 
 	command := flag.Arg(0)
 
-	if len(*model) == 0 {
+	if len(*modelName) == 0 {
 		log.Fatalf("Model is required")
 	}
 
-	log.Printf("Using ollama model: %s", *model)
-
-	ctx := context.Background()
-	httpc := &http.Client{}
-	url, err := url.Parse(*ollamaAddr)
+	model, err := embeddings.ModelFromString(*modelName)
 	if err != nil {
-		log.Fatalf("Failed to parse ollama address: %s", err)
-	}
-	ollamaClient := ollama.NewClient(url, httpc)
-	if v, err := ollamaClient.Version(ctx); err != nil {
-		log.Fatalf("Failed to get Ollama version: %s", err)
-	} else {
-		log.Printf("Ollama version: %s", v)
+		log.Fatalf("Failed to parse model: %s", err)
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-	//rsearch := redisearch.NewClient("localhost:6379", index)
-	pong := rdb.Ping(ctx)
-	if pong.Err() != nil {
-		log.Fatalf("Failed to ping Redis: %s", pong.Err())
+	log.Printf("Using ollama model: %s", model)
+
+	httpc := &http.Client{}
+	oe, err := embeddings.NewOllamaEmbedder(*ollamaAddr, httpc)
+	if err != nil {
+		log.Fatalf("Failed to create Ollama client: %s", err)
 	}
-	log.Printf("Redis ping: %s", pong.Val())
+
+	var ec embeddings.Client
+	switch *backend {
+	case "redis":
+		ec, err = embeddings.NewRedisClient("localhost:6379", oe)
+	}
 
 	// Handle Ctrl-C
 	c := make(chan os.Signal, 1)
@@ -66,69 +60,134 @@ func main() {
 		os.Exit(1)
 	}()
 
+	ctx := context.Background()
 	switch command {
 	case "repl":
-		runRepl(ctx, rdb, ollamaClient, *model)
+		runRepl(ctx, ec, model)
 	case "create_index":
-		runCreateIndex(ctx, rdb, *model, *indexDim, *indexDist)
+		runCreateIndex(ctx, ec, model, &embeddings.SchemaConfig{
+			IndexDim:       *indexDim,
+			DistanceMetric: *indexDist,
+		})
 	case "drop_index":
-		runDropIndex(ctx, rdb, *model)
+		runDropIndex(ctx, ec, model)
+	case "inject":
+		runInject(ctx, ec, model, *readFrom)
+	case "drop_keys":
+		runDropKeys(ctx, ec, model)
 	default:
 		runHelp()
 	}
+}
+
+func runDropKeys(ctx context.Context, ec embeddings.Client, model embeddings.Model) {
+	if err := ec.DeleteAllDocuments(ctx, model); err != nil {
+		log.Fatalf("Failed to delete all keys: %s", err)
+	}
+}
+
+func runInject(ctx context.Context, ec embeddings.Client, model embeddings.Model, readFrom string) {
+	if len(readFrom) == 0 {
+		log.Fatalf("read_from is required")
+	}
+	f, err := os.Open(readFrom)
+	if err != nil {
+		log.Fatalf("Failed to open %s: %s", readFrom, err)
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	cnt := 0
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				log.Printf("Done reading file")
+				break
+			} else {
+				log.Fatalf("Failed to read from file: %s", err)
+			}
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var doc embeddings.Document
+		if err := json.Unmarshal([]byte(line), &doc); err != nil {
+			log.Fatalf("Failed to unmarshal line: %s", err)
+		}
+		if len(doc.Embedding) == 0 {
+			log.Printf("Skipping embedding without vector: %s", doc.FileId)
+			continue
+		}
+		if allZero(doc.Embedding) {
+			log.Printf("Skipping zero vector: %s", doc.FileId)
+			continue
+		}
+
+		if err := ec.InsertDocument(ctx, model, &doc); err != nil {
+			log.Printf("Failed to inject embedding: %s", err)
+			log.Printf("Do you want to continue? [y/n]")
+			var answer string
+			fmt.Scanln(&answer)
+			if answer != "y" {
+				log.Printf("Exiting...")
+				os.Exit(1)
+			}
+		} else {
+			cnt++
+		}
+	}
+
+	log.Printf("Injected %d records", cnt)
+}
+
+func injectEmbedding(ctx context.Context, ec embeddings.Client, model embeddings.Model, doc *embeddings.Document) error {
+	if err := ec.InsertDocument(ctx, model, doc); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func allZero(v []float64) bool {
+	for _, x := range v {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func getIndexForModel(model string) string {
 	return fmt.Sprintf("idx:embeddings-%s", model)
 }
 
+func getPrefixForModel(model string) string {
+	return fmt.Sprintf("embeddings-%s:", model)
+}
+
 func getIndexInfo(ctx context.Context, rc *redis.Client, index string) (string, error) {
 	return rc.Info(ctx, index).Result()
 }
 
-func runDropIndex(ctx context.Context, rc *redis.Client, model string) {
-	index := getIndexForModel(model)
-	if _, err := getIndexInfo(ctx, rc, index); err != nil {
-		log.Fatalf("Failed to fetch index info: %s", err)
-	}
-	if err := rc.Do(ctx, "FT.DROPINDEX", index).Err(); err != nil {
+func runDropIndex(ctx context.Context, ec embeddings.Client, model embeddings.Model) {
+	if err := ec.DropSchema(ctx, model); err != nil {
 		log.Fatalf("Failed to drop index: %s", err)
 	}
-	log.Printf("Index %s successfully dropped", index)
 }
 
-func runCreateIndex(ctx context.Context, rc *redis.Client, model string, dim int, dist string) {
-	index := getIndexForModel(model)
-	log.Printf("Creating index %s", index)
-	indexInfo, err := getIndexInfo(ctx, rc, index)
-	if err != nil {
-		log.Fatalf("Failed to fetch index info: %s", err)
-	}
-	if len(indexInfo) != 0 {
-		log.Fatalf("Index %s already exists", index)
-	}
-
-	_, err = rc.Do(ctx, "FT.CREATE", index,
-		"SCHEMA",
-		"file_id", "TEXT", "WEIGHT", "1.0", "NOSTEM",
-		"text", "TEXT", "WEIGHT", "1.0", "NOSTEM",
-		"embedding", "VECTOR", "HNSW", "6", "TYPE", "FLOAT64", "DIM", dim, "DISTANCE_METRIC", dist,
-	).Result()
-
-	if err != nil {
+func runCreateIndex(ctx context.Context, ec embeddings.Client, model embeddings.Model, cfg *embeddings.SchemaConfig) {
+	if err := ec.CreateSchema(ctx, model, cfg); err != nil {
 		log.Fatalf("Failed to create index: %s", err)
 	}
-
-	log.Printf("Index created: %s", index)
 }
 
 func runHelp() {
 	log.Println("Usage: TODO")
 }
 
-func runRepl(ctx context.Context, rc *redis.Client, oc *ollama.Client, model string) {
+func runRepl(ctx context.Context, ec embeddings.Client, model embeddings.Model) {
 	// Start REPL loop
-	index := getIndexForModel(model)
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print(">: ")
@@ -137,61 +196,16 @@ func runRepl(ctx context.Context, rc *redis.Client, oc *ollama.Client, model str
 			log.Printf("Failed to read input: %s", err)
 			continue
 		}
-		fmt.Printf("Compute embedding vector...")
-		embed, err := computeEmbedding(ctx, oc, model, input)
-		if err != nil {
-			log.Printf("Failed to compute embedding: %s", err)
-			continue
+		fmt.Printf("Computing embedding vector...")
+		doc := &embeddings.Document{
+			Text: input,
 		}
-		fmt.Println("done.")
-
-		res, err := findSimilar(ctx, rc, index, embed, 3)
+		knn, err := ec.FindKNearest(ctx, model, doc, 3)
 		if err != nil {
 			log.Printf("Failed to execute search query: %s", err)
-			continue
 		}
-		log.Printf("Result: %+v", res)
+		for _, d := range knn {
+			fmt.Printf("* %s\n", d.Text)
+		}
 	}
-}
-
-// Encode a slice of float64 values as a byte slice (little-endian)
-func float64ToBytesLE(floats []float64) []byte {
-	var bytes []byte
-	for _, f := range floats {
-		bits := math.Float64bits(f)
-		bytes = append(bytes,
-			byte(bits), // Least significant byte first
-			byte(bits>>8),
-			byte(bits>>16),
-			byte(bits>>24),
-			byte(bits>>32),
-			byte(bits>>40),
-			byte(bits>>48),
-			byte(bits>>56), // Most significant byte last
-		)
-	}
-	return bytes
-}
-
-func findSimilar(ctx context.Context, client *redis.Client, index string, vector []float64, numRes int) (any, error) {
-	vectorBytes := float64ToBytesLE(vector)
-	res, err := client.Do(ctx, "FT.SEARCH", index,
-		"*",                                     // Search all documents
-		"PARAMS", "2", "vec_param", vectorBytes, // Vector query params
-		"DIALECT", "2", // Optional, using a specific dialect version if needed
-		"RETURN", "2", "$.file_id", "$.text", // Specify fields to return (e.g., title)
-		"LIMIT", "0", strconv.Itoa(numRes), // Limit the result set
-	).Result()
-	return res, err
-}
-
-func computeEmbedding(ctx context.Context, oc *ollama.Client, model string, prompt string) ([]float64, error) {
-	e, err := oc.Embeddings(ctx, &ollama.EmbeddingRequest{
-		Model:  model,
-		Prompt: prompt,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return e.Embedding, nil
 }
