@@ -84,6 +84,15 @@ func (c *RedisClient) InsertDocument(ctx context.Context, model Model, doc *Docu
 	return nil
 }
 
+func (c *RedisClient) InsertAllDocuments(ctx context.Context, model Model, docs []*Document) error {
+	for _, doc := range docs {
+		if err := c.InsertDocument(ctx, model, doc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *RedisClient) DeleteDocument(ctx context.Context, model Model, docKey string) error {
 	if _, err := c.rc.Del(ctx, docKey).Result(); err != nil {
 		return fmt.Errorf("Failed to delete key: %s", err)
@@ -110,7 +119,7 @@ func (c *RedisClient) DeleteAllDocuments(ctx context.Context, model Model) error
 func (c *RedisClient) FindKNearest(ctx context.Context, model Model, doc *Document, k int) ([]*Document, error) {
 	if doc.Embedding == nil {
 		var vector []float64
-		vector, err := c.emb.Embed(ctx, model, doc.Text)
+		vector, err := c.emb.Embed(ctx, doc.Text)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to embed text: %s", err)
 		}

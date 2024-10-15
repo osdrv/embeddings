@@ -29,7 +29,7 @@ func main() {
 	command := flag.Arg(0)
 
 	if len(*modelName) == 0 {
-		log.Fatalf("Model is required")
+		log.Fatalf("Model name is required")
 	}
 
 	model, err := embeddings.ModelFromString(*modelName)
@@ -40,7 +40,7 @@ func main() {
 	log.Printf("Using ollama model: %s", model)
 
 	httpc := &http.Client{}
-	oe, err := embeddings.NewOllamaEmbedder(*ollamaAddr, httpc)
+	oe, err := embeddings.NewOllamaEmbedder(*ollamaAddr, httpc, model)
 	if err != nil {
 		log.Fatalf("Failed to create Ollama client: %s", err)
 	}
@@ -49,6 +49,8 @@ func main() {
 	switch *backend {
 	case "redis":
 		ec, err = embeddings.NewRedisClient("localhost:6379", oe)
+	case "chroma":
+		ec, err = embeddings.NewChromaClient("http://localhost:35000", oe)
 	}
 
 	// Handle Ctrl-C

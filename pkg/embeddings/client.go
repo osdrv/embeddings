@@ -6,6 +6,7 @@ type Client interface {
 	CreateSchema(ctx context.Context, model Model, cfg *SchemaConfig) error
 	DropSchema(ctx context.Context, model Model) error
 	InsertDocument(ctx context.Context, model Model, doc *Document) error
+	InsertAllDocuments(ctx context.Context, model Model, docs []*Document) error
 	DeleteDocument(ctx context.Context, model Model, docKey string) error
 	DeleteAllDocuments(ctx context.Context, model Model) error
 	FindKNearest(ctx context.Context, model Model, doc *Document, k int) ([]*Document, error)

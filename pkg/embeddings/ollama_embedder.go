@@ -11,12 +11,13 @@ import (
 )
 
 type OllamaEmbedder struct {
-	oc *ollama.Client
+	oc    *ollama.Client
+	model Model
 }
 
 var _ Embedder = (*OllamaEmbedder)(nil)
 
-func NewOllamaEmbedder(addr string, httpc *http.Client) (*OllamaEmbedder, error) {
+func NewOllamaEmbedder(addr string, httpc *http.Client, model Model) (*OllamaEmbedder, error) {
 	ctx := context.Background()
 	url, err := url.Parse(addr)
 	if err != nil {
@@ -30,13 +31,14 @@ func NewOllamaEmbedder(addr string, httpc *http.Client) (*OllamaEmbedder, error)
 	}
 
 	return &OllamaEmbedder{
-		oc: oc,
+		oc:    oc,
+		model: model,
 	}, nil
 }
 
-func (e *OllamaEmbedder) Embed(ctx context.Context, model Model, prompt string) ([]float64, error) {
+func (e *OllamaEmbedder) Embed(ctx context.Context, prompt string) ([]float64, error) {
 	res, err := e.oc.Embeddings(ctx, &ollama.EmbeddingRequest{
-		Model:  model.Name(),
+		Model:  e.model.Name(),
 		Prompt: prompt,
 	})
 	if err != nil {
